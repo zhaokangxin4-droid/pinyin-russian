@@ -21,6 +21,7 @@ namespace PinyinRussian {
         [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumProc cb,IntPtr data);
         [DllImport("user32.dll")] internal static extern bool EnumChildWindows(IntPtr parent,EnumProc cb,IntPtr data);
         [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")] internal static extern bool GetWindowRect(IntPtr hwnd,out RECT rect);
         [DllImport("user32.dll",CharSet=CharSet.Unicode)] internal static extern int GetClassName(IntPtr hwnd,StringBuilder text,int size);
         [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr h);
@@ -145,6 +146,26 @@ namespace PinyinRussian {
         static bool HasCandidateButtons(UIAutomationClient.IUIAutomationElement element) {
             return CandidateItems(element).Any(item=>item.CurrentIsOffscreen==0 && IsChinese(item.CurrentName));
         }
+        static Rectangle CandidateBounds(UIAutomationClient.IUIAutomationElement panel,Rectangle itemBounds) {
+            Rectangle bounds=itemBounds;bool foundHost=false;
+            try {
+                var element=panel;
+                for(int depth=0;element!=null&&depth<7;depth++) {
+                    string className=element.CurrentClassName;
+                    if(IsCandidateHost(className)) {
+                        var hwnd=element.CurrentNativeWindowHandle;Native.RECT rect;
+                        if(hwnd!=IntPtr.Zero&&Native.IsWindowVisible(hwnd)&&Native.GetWindowRect(hwnd,out rect)&&rect.right>rect.left&&rect.bottom>rect.top) {
+                            bounds=Rectangle.Union(bounds,Rectangle.FromLTRB(rect.left,rect.top,rect.right,rect.bottom));foundHost=true;
+                        }
+                        if(className=="Microsoft.IME.UIManager.CandidateWindow.Host"&&foundHost)break;
+                    }
+                    element=UI.RawViewWalker.GetParentElement(element);
+                }
+            }catch{}
+            // A virtual candidate panel may omit its composition line and footer.
+            if(!foundHost)bounds.Inflate(0,32);
+            return bounds;
+        }
         static UIAutomationClient.IUIAutomationElement FindPanel(IntPtr foreground) {
             lock(eventLock) {
                 if(eventPanel!=null&&eventWindow==foreground)try{if(eventPanel.CurrentIsOffscreen==0)return eventPanel;}catch{eventPanel=null;}
@@ -225,7 +246,7 @@ namespace PinyinRussian {
                 if(r.right-r.left<10 || r.bottom-r.top<10){Diagnostic="invalid bounds";return null;}
                 Diagnostic="candidate ready";
                 int selectedSlot=Int32.Parse(selected.CurrentAutomationId.Substring("CandidateList.CandidateButton.".Length));
-                return new Candidate {Chinese=selected.CurrentName,SelectedNumber=selectedSlot+1,Options=options.OrderBy(x=>x.Number).ToArray(),Window=hwnd,FocusId=focus==null?"native:"+Native.FocusWindow(hwnd):FocusId(focus),Bounds=Rectangle.FromLTRB(r.left,r.top,r.right,r.bottom)};
+                return new Candidate {Chinese=selected.CurrentName,SelectedNumber=selectedSlot+1,Options=options.OrderBy(x=>x.Number).ToArray(),Window=hwnd,FocusId=focus==null?"native:"+Native.FocusWindow(hwnd):FocusId(focus),Bounds=CandidateBounds(panel,Rectangle.FromLTRB(r.left,r.top,r.right,r.bottom))};
             } catch(Exception ex) {Diagnostic=ex.GetType().Name+": "+ex.Message;return null;}
         }
         internal static bool FocusMatches(Candidate c) {
@@ -342,7 +363,7 @@ namespace PinyinRussian {
         int[] rowHeights;
         internal Overlay() {
             FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;TopMost=true;BackColor=Color.FromArgb(246,249,253);Padding=new Padding(12);Width=510;
-            DoubleBuffered=true;
+            DoubleBuffered=true;Opacity=0.70;
         }
         protected override bool ShowWithoutActivation { get {return true;} }
         protected override CreateParams CreateParams {get {var p=base.CreateParams;p.ExStyle|=0x08000000|0x00000080|0x20;return p;}}
@@ -362,7 +383,7 @@ namespace PinyinRussian {
             }
             Height=70+rowHeights.Sum();
             int x=Math.Max(area.Left,Math.Min(c.Bounds.Left,area.Right-Width));
-            int y=c.Bounds.Bottom+5;if(y+Height>area.Bottom)y=Math.Max(area.Top,c.Bounds.Top-Height-5);
+            int y=c.Bounds.Bottom+10;if(y+Height>area.Bottom)y=Math.Max(area.Top,c.Bounds.Top-Height-10);
             Location=new Point(x,y);if(!Visible)Show();Invalidate();
         }
         string RowText(string chinese) {
@@ -390,6 +411,26 @@ namespace PinyinRussian {
         protected override void Dispose(bool disposing) {if(disposing){chineseFont.Dispose();russianFont.Dispose();hintFont.Dispose();}base.Dispose(disposing);}
     }
 
+    static class UiSettings {
+        internal const int DefaultTransparency=30;
+        internal static int LoadTransparency(string path) {
+            try {
+                var data=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(path,Encoding.UTF8));
+                object saved;int value;
+                if(data!=null&&data.TryGetValue("overlayTransparencyPercent",out saved)&&Int32.TryParse(Convert.ToString(saved),out value)&&value>=0&&value<=100)return value;
+            }catch{}
+            return DefaultTransparency;
+        }
+        internal static bool SaveTransparency(string path,int value) {
+            try {
+                string temporary=path+".tmp";
+                File.WriteAllText(temporary,new JavaScriptSerializer().Serialize(new {overlayTransparencyPercent=value}),new UTF8Encoding(false));
+                if(File.Exists(path))File.Replace(temporary,path,null);else File.Move(temporary,path);
+                return true;
+            }catch{return false;}
+        }
+    }
+
     sealed class MainForm : Form {
         readonly bool startHidden;
         protected override bool ShowWithoutActivation {get{return startHidden;}}
@@ -397,27 +438,42 @@ namespace PinyinRussian {
         readonly Label status=new Label(), last=new Label();readonly NotifyIcon tray=new NotifyIcon();
         readonly TextBox input=new TextBox(), output=new TextBox();
         readonly CheckBox enabled=new CheckBox();
+        readonly TrackBar transparency=new TrackBar();
+        readonly Label transparencyValue=new Label(), transparencyHint=new Label();
+        readonly string settingsPath;
         Candidate current;string translated;CancellationTokenSource translateCancel;
         readonly Dictionary<string,string> pageTranslations=new Dictionary<string,string>(), pageErrors=new Dictionary<string,string>();
         DateTime stableSince;bool requested,inserting,closing;volatile bool monitorEnabled=true;
         Thread worker;int hotkeyMask;
-        internal MainForm(bool hideAtStartup=false) {
+        internal MainForm(bool hideAtStartup=false,string preferencesPath=null) {
             startHidden=hideAtStartup;
-            Text="拼音俄语助手 · 本地离线版";ClientSize=new Size(720,560);MinimumSize=new Size(700,560);Font=new Font("Microsoft YaHei UI",10);StartPosition=FormStartPosition.CenterScreen;BackColor=Color.FromArgb(247,249,253);
+            settingsPath=preferencesPath??Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings.json");
+            Text="拼音俄语助手 · 本地离线版";ClientSize=new Size(720,640);MinimumSize=new Size(700,640);Font=new Font("Microsoft YaHei UI",10);StartPosition=FormStartPosition.CenterScreen;BackColor=Color.FromArgb(247,249,253);
             var title=new Label {Text="拼音 → 俄语",Font=new Font("Microsoft YaHei UI",22,FontStyle.Bold),ForeColor=Color.FromArgb(27,55,96),AutoSize=true,Location=new Point(24,20)};Controls.Add(title);
             enabled.Text="自动跟随微软拼音候选词";enabled.Checked=true;enabled.AutoSize=true;enabled.Location=new Point(26,83);enabled.CheckedChanged+=(s,e)=>{monitorEnabled=enabled.Checked;if(!monitorEnabled)Reset();};Controls.Add(enabled);
             var help=new Label {Text="候选框出现后稍停，只显示当前选中候选词或句子的俄语。\nCtrl + Alt + R：取消未上屏拼音并输入当前选中项的俄语（不发送）\nCtrl + Alt + C：复制当前选中项的俄语　　Ctrl + Alt + P：暂停 / 继续\n自动跟随需开启微软拼音“使用以前版本”。",Location=new Point(24,116),Size=new Size(675,96)};Controls.Add(help);
-            status.Location=new Point(24,213);status.Size=new Size(675,25);status.ForeColor=Color.FromArgb(35,91,123);status.Text="等待拼音候选词 · 翻译只连接本机 Ollama";Controls.Add(status);
-            last.Location=new Point(24,242);last.Size=new Size(675,38);last.Text="单字可能有多种含义，完整词句通常更准确。";Controls.Add(last);
-            Controls.Add(new Label {Text="整句翻译 / 手动备用（输入或粘贴中文）",Location=new Point(24,285),AutoSize=true});
-            input.Multiline=true;input.SetBounds(24,312,670,66);input.Font=new Font("Microsoft YaHei UI",12);input.Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right;Controls.Add(input);
-            var button=new Button {Text="翻译整句",Location=new Point(24,389),Size=new Size(125,32)};button.Click+=async(s,e)=>{button.Enabled=false;output.Tag=null;output.Text="正在本地翻译…";try{string ru=await translator.Translate(input.Text.Trim(),CancellationToken.None);output.Tag=ru;output.Text=StressMark.Display(ru);}catch(Exception ex){output.Text=ex.Message;}finally{button.Enabled=true;}};Controls.Add(button);
-            var copy=new Button {Text="复制整句俄语",Location=new Point(160,389),Size=new Size(145,32)};copy.Click+=(s,e)=>{string ru=output.Tag as string;if(ru!=null)try{Clipboard.SetText(ru);}catch{status.Text="剪贴板正忙，请重试。";}};Controls.Add(copy);
-            output.Multiline=true;output.ReadOnly=true;output.SetBounds(24,432,670,90);output.Font=new Font("Segoe UI",12);output.ScrollBars=ScrollBars.Vertical;output.Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right;Controls.Add(output);
-            Controls.Add(new Label {Text="〔?〕表示重音待确认；复制和输入只包含俄语与已确认重音。关闭窗口后在托盘继续运行。",Location=new Point(24,532),AutoSize=true,Font=new Font("Microsoft YaHei UI",8)});
+            transparencyValue.SetBounds(24,222,185,25);Controls.Add(transparencyValue);
+            transparency.Minimum=0;transparency.Maximum=100;transparency.TickFrequency=10;transparency.SmallChange=1;transparency.LargeChange=10;transparency.AccessibleName="浮窗透明度";transparency.SetBounds(209,213,355,45);transparency.Value=UiSettings.LoadTransparency(settingsPath);Controls.Add(transparency);
+            var resetTransparency=new Button {Text="恢复默认",Location=new Point(575,216),Size=new Size(119,32)};resetTransparency.Click+=(s,e)=>{if(transparency.Value==UiSettings.DefaultTransparency)ApplyTransparency(true);else transparency.Value=UiSettings.DefaultTransparency;};Controls.Add(resetTransparency);
+            transparencyHint.SetBounds(24,260,675,24);transparencyHint.Font=new Font("Microsoft YaHei UI",9);transparencyHint.ForeColor=Color.FromArgb(83,99,121);Controls.Add(transparencyHint);
+            transparency.ValueChanged+=(s,e)=>ApplyTransparency(true);ApplyTransparency(false);
+            status.Location=new Point(24,293);status.Size=new Size(675,25);status.ForeColor=Color.FromArgb(35,91,123);status.Text="等待拼音候选词 · 翻译只连接本机 Ollama";Controls.Add(status);
+            last.Location=new Point(24,322);last.Size=new Size(675,38);last.Text="单字可能有多种含义，完整词句通常更准确。";Controls.Add(last);
+            Controls.Add(new Label {Text="整句翻译 / 手动备用（输入或粘贴中文）",Location=new Point(24,365),AutoSize=true});
+            input.Multiline=true;input.SetBounds(24,392,670,66);input.Font=new Font("Microsoft YaHei UI",12);input.Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right;Controls.Add(input);
+            var button=new Button {Text="翻译整句",Location=new Point(24,469),Size=new Size(125,32)};button.Click+=async(s,e)=>{button.Enabled=false;output.Tag=null;output.Text="正在本地翻译…";try{string ru=await translator.Translate(input.Text.Trim(),CancellationToken.None);output.Tag=ru;output.Text=StressMark.Display(ru);}catch(Exception ex){output.Text=ex.Message;}finally{button.Enabled=true;}};Controls.Add(button);
+            var copy=new Button {Text="复制整句俄语",Location=new Point(160,469),Size=new Size(145,32)};copy.Click+=(s,e)=>{string ru=output.Tag as string;if(ru!=null)try{Clipboard.SetText(ru);}catch{status.Text="剪贴板正忙，请重试。";}};Controls.Add(copy);
+            output.Multiline=true;output.ReadOnly=true;output.SetBounds(24,512,670,90);output.Font=new Font("Segoe UI",12);output.ScrollBars=ScrollBars.Vertical;output.Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right;Controls.Add(output);
+            Controls.Add(new Label {Text="〔?〕表示重音待确认；复制和输入只包含俄语与已确认重音。关闭窗口后在托盘继续运行。",Location=new Point(24,612),AutoSize=true,Font=new Font("Microsoft YaHei UI",8)});
             tray.Icon=SystemIcons.Information;tray.Text="拼音俄语助手";tray.Visible=true;
             var menu=new ContextMenuStrip();menu.Items.Add("打开助手",null,(s,e)=>Open());menu.Items.Add("暂停 / 继续",null,(s,e)=>enabled.Checked=!enabled.Checked);menu.Items.Add("退出",null,(s,e)=>{closing=true;Close();});tray.ContextMenuStrip=menu;tray.DoubleClick+=(s,e)=>Open();
             Shown+=(s,e)=>{StartMonitor();if(startHidden)Hide();};FormClosing+=(s,e)=>{if(!closing && e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Hide();return;}closing=true;monitorEnabled=false;if(translateCancel!=null)translateCancel.Cancel();for(int i=1;i<=3;i++)Native.UnregisterHotKey(Handle,i);tray.Visible=false;overlay.Close();};
+        }
+        void ApplyTransparency(bool save) {
+            overlay.Opacity=(100-transparency.Value)/100.0;
+            transparencyValue.Text="浮窗透明度："+transparency.Value+"%";
+            transparencyHint.Text="向右更透明 · 0% 不透明，100% 完全透明 · 自动保存";
+            if(save&&!UiSettings.SaveTransparency(settingsPath,transparency.Value))transparencyHint.Text="已生效，但设置无法保存；重启后将使用之前的设置。";
         }
         void Open(){Show();WindowState=FormWindowState.Normal;Activate();}
         void StartMonitor() {

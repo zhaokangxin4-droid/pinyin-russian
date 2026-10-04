@@ -7,5 +7,7 @@ data/russian-stress-ambiguous.txt
 dictionary-source/
 diagnostics.enabled
 diagnostics.txt
+settings.json
+settings.json.tmp
 __pycache__/
 *.pyc
