@@ -1,0 +1,11 @@
+PinyinRussian.exe
+Interop.UIAutomationClient.dll
+.build/
+*.zip
+data/russian-stress.bin
+data/russian-stress-ambiguous.txt
+dictionary-source/
+diagnostics.enabled
+diagnostics.txt
+__pycache__/
+*.pyc

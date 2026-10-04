@@ -1,0 +1,6 @@
+*.cs text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.ps1 text eol=crlf
+*.dll binary
+*.png binary
