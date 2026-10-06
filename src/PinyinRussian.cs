@@ -7,6 +7,7 @@ using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -322,36 +323,158 @@ namespace PinyinRussian {
         }
     }
 
+    sealed class TranslationSettings {
+        internal bool UseAzure,UseChatGpt,UseDeepSeek;
+        internal string Key="",Region="",DeepSeekKey="";
+        internal string Name {get{return UseDeepSeek?"DeepSeek Flash（关闭思考）":UseChatGpt?"ChatGPT 订阅（GPT-5.6 Luna）":UseAzure?"微软 Translator 在线翻译":"本地 Ollama（TranslateGemma 4B）";}}
+        internal TranslationSettings Copy() {return new TranslationSettings {UseAzure=UseAzure,UseChatGpt=UseChatGpt,UseDeepSeek=UseDeepSeek,Key=Key,Region=Region,DeepSeekKey=DeepSeekKey};}
+        internal void Validate() {
+            if((UseAzure?1:0)+(UseChatGpt?1:0)+(UseDeepSeek?1:0)>1)throw new Exception("请只选择一种翻译服务。");
+            if(UseDeepSeek){if(!Regex.IsMatch(DeepSeekKey??"","^[A-Za-z0-9_-]{16,256}$"))throw new Exception("请填写 DeepSeek API 密钥，不是网页登录密码。");return;}
+            if(UseChatGpt||!UseAzure)return;
+            if(!Regex.IsMatch(Key??"","^[A-Za-z0-9]{16,256}$"))throw new Exception("请填写 Azure Translator 资源的密钥，不是账号密码。");
+            if(!Regex.IsMatch(Region??"","^[a-z0-9-]{0,64}$"))throw new Exception("区域应填写资源的 Location 值，如 westeurope；global 可留空。");
+        }
+        internal static TranslationSettings Load(string path) {
+            if(!File.Exists(path))return new TranslationSettings();
+            try {
+                var data=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(path,Encoding.UTF8));
+                var value=new TranslationSettings {UseAzure=data.ContainsKey("useAzure")&&Convert.ToBoolean(data["useAzure"]),UseChatGpt=data.ContainsKey("useChatGpt")&&Convert.ToBoolean(data["useChatGpt"]),UseDeepSeek=data.ContainsKey("useDeepSeek")&&Convert.ToBoolean(data["useDeepSeek"]),Region=data.ContainsKey("region")?Convert.ToString(data["region"]):""};
+                if(data.ContainsKey("protectedKey"))try{value.Key=Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(Convert.ToString(data["protectedKey"])),null,DataProtectionScope.CurrentUser));}catch{}
+                if(data.ContainsKey("protectedDeepSeekKey"))try{value.DeepSeekKey=Encoding.UTF8.GetString(ProtectedData.Unprotect(Convert.FromBase64String(Convert.ToString(data["protectedDeepSeekKey"])),null,DataProtectionScope.CurrentUser));}catch{}
+                return value;
+            }catch{return new TranslationSettings {UseAzure=true};}
+        }
+        internal void Save(string path) {
+            Validate();
+            string protectedKey=String.IsNullOrEmpty(Key)?"":Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(Key),null,DataProtectionScope.CurrentUser));
+            string protectedDeepSeekKey=String.IsNullOrEmpty(DeepSeekKey)?"":Convert.ToBase64String(ProtectedData.Protect(Encoding.UTF8.GetBytes(DeepSeekKey),null,DataProtectionScope.CurrentUser));
+            string temporary=path+".tmp";
+            File.WriteAllText(temporary,new JavaScriptSerializer().Serialize(new {useAzure=UseAzure,useChatGpt=UseChatGpt,useDeepSeek=UseDeepSeek,region=Region,protectedKey=protectedKey,protectedDeepSeekKey=protectedDeepSeekKey}),new UTF8Encoding(false));
+            if(File.Exists(path))File.Replace(temporary,path,null);else File.Move(temporary,path);
+        }
+    }
+
     sealed class Translator : IDisposable {
+        readonly ChatGptClient chatgpt=new ChatGptClient();
+        readonly DeepSeekClient deepseek=new DeepSeekClient();
         readonly HttpClient client=new HttpClient(new HttpClientHandler { UseProxy=false }) { Timeout=TimeSpan.FromSeconds(75) };
+        readonly HttpClient azureClient=new HttpClient(new HttpClientHandler { AllowAutoRedirect=false }) { Timeout=TimeSpan.FromSeconds(20) };
         readonly Dictionary<string,string> cache=new Dictionary<string,string>();
+        readonly LinkedList<string> cacheRecency=new LinkedList<string>();
+        readonly Dictionary<string,LinkedListNode<string>> cacheNodes=new Dictionary<string,LinkedListNode<string>>();
+        internal const int CacheCapacity=512;
         readonly SemaphoreSlim gate=new SemaphoreSlim(1,1);
+        readonly object settingsLock=new object();
+        TranslationSettings settings=new TranslationSettings();int revision;
+        internal string ServiceName {get{lock(settingsLock)return settings.Name;}}
+        internal bool UsesAzure {get{lock(settingsLock)return settings.UseAzure;}}
+        internal void Configure(TranslationSettings value) {lock(settingsLock){settings=value.Copy();revision++;cache.Clear();cacheRecency.Clear();cacheNodes.Clear();}}
+        internal bool TryCached(string text,out string russian) {
+            lock(settingsLock) {
+                if(!cache.TryGetValue(text,out russian))return false;
+                var node=cacheNodes[text];cacheRecency.Remove(node);cacheRecency.AddFirst(node);return true;
+            }
+        }
+        void CacheResult(string text,string russian) {
+            if(cache.ContainsKey(text)){cache[text]=russian;var node=cacheNodes[text];cacheRecency.Remove(node);cacheRecency.AddFirst(node);return;}
+            if(cache.Count>=CacheCapacity){string oldest=cacheRecency.Last.Value;cacheRecency.RemoveLast();cache.Remove(oldest);cacheNodes.Remove(oldest);}
+            cache[text]=russian;cacheNodes[text]=cacheRecency.AddFirst(text);
+        }
         internal static string Prompt(string s) {
             return "You are a professional Chinese (zh-Hans) to Russian (ru) translator. Your goal is to accurately convey the meaning and nuances of the original Chinese text while adhering to Russian grammar, vocabulary, and cultural sensitivities.\nProduce only the Russian translation, without any additional explanations or commentary. Please translate the following Chinese text into Russian:\n\n\n"+s;
         }
         internal async Task<string> Translate(string s,CancellationToken cancel) {
             if(!Reader.IsChinese(s)) throw new Exception("候选文字不是中文，或长度超过 500 字。");
+            cancel.ThrowIfCancellationRequested();string cached;if(TryCached(s,out cached))return cached;
             await gate.WaitAsync(cancel);
             try {
-                string value;if(cache.TryGetValue(s,out value)) return value;
+                TranslationSettings selected;int version;string value;
+                lock(settingsLock){selected=settings.Copy();version=revision;if(TryCached(s,out value))return value;}
+                selected.Validate();
                 var json=new JavaScriptSerializer();
-                var body=json.Serialize(new {model="translategemma:4b",messages=new[]{new {role="user",content=Prompt(s)}},stream=false,keep_alive="10m",options=new {temperature=0,num_ctx=2048,num_predict=700}});
+                if(selected.UseDeepSeek) {
+                    value=await deepseek.Translate(s,selected.DeepSeekKey,cancel);
+                } else if(selected.UseChatGpt) {
+                    value=await chatgpt.Translate(s,cancel);
+                } else if(selected.UseAzure) {
+                    using(var request=new HttpRequestMessage(HttpMethod.Post,"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from=zh-Hans&to=ru&textType=plain")) {
+                        request.Headers.Add("Ocp-Apim-Subscription-Key",selected.Key);
+                        if(!String.IsNullOrEmpty(selected.Region)&&selected.Region!="global")request.Headers.Add("Ocp-Apim-Subscription-Region",selected.Region);
+                        request.Content=new StringContent(json.Serialize(new[]{new {Text=s}}),Encoding.UTF8,"application/json");
+                        using(var response=await azureClient.SendAsync(request,cancel)) {
+                            if(!response.IsSuccessStatusCode) {
+                                int code=(int)response.StatusCode;
+                                if(code==401)throw new Exception("微软翻译认证失败：请检查密钥和区域。");
+                                if(code==403)throw new Exception("微软翻译未获授权或免费额度已用完：请检查 Azure 资源状态。");
+                                if(code==429)throw new Exception("微软翻译达到请求或额度限制，请稍后重试并检查 F0 用量。");
+                                throw new Exception("微软翻译服务暂时无法使用（HTTP "+code+"），请检查资源配置或稍后重试。");
+                            }
+                            try {
+                                var rows=json.Deserialize<List<Dictionary<string,object>>>(await response.Content.ReadAsStringAsync());
+                                var translations=(System.Collections.IEnumerable)rows[0]["translations"];
+                                value=null;
+                                foreach(Dictionary<string,object> item in translations)if(Convert.ToString(item["to"])=="ru"){value=Convert.ToString(item["text"]);break;}
+                            }catch{throw new Exception("微软翻译返回了无法读取的结果，请重试。");}
+                        }
+                    }
+                } else {
+                var body=json.Serialize(new {model="translategemma:4b",messages=new[]{new {role="user",content=Prompt(s)}},stream=false,keep_alive="1h",options=new {temperature=0,num_ctx=2048,num_predict=700}});
                 using(var content=new StringContent(body,Encoding.UTF8,"application/json"))
                 using(var response=await client.PostAsync("http://127.0.0.1:11434/api/chat",content,cancel)) {
                     if(!response.IsSuccessStatusCode) throw new Exception("本地翻译服务返回错误 "+(int)response.StatusCode+"。请确认已安装 translategemma:4b。");
                     var data=json.Deserialize<Dictionary<string,object>>(await response.Content.ReadAsStringAsync());
                     var msg=(Dictionary<string,object>)data["message"];
                     value=((string)msg["content"]).Trim();
-                    if(value.Length==0 || value.Length>4000 || !Regex.IsMatch(value,"[\\u0400-\\u04ff]")) throw new Exception("模型没有返回有效俄语，请换一个更完整的中文表达。");
                     if(data.ContainsKey("done_reason") && Convert.ToString(data["done_reason"])=="length") throw new Exception("翻译未完成，请缩短句子后重试。");
-                    try{value=StressMark.Apply(value);}catch(Exception ex){throw new Exception("重音词典无法读取，请保持 data 文件夹与助手在一起。",ex);}
-                    if(cache.Count>=250) cache.Clear();
-                    cache[s]=value;return value;
                 }
-            } catch(HttpRequestException) { throw new Exception("无法连接本机 Ollama。请先打开 Ollama，并确认 translategemma:4b 可用。"); }
+                }
+                if(String.IsNullOrWhiteSpace(value)||value.Length>4000||!Regex.IsMatch(value,"[\\u0400-\\u04ff]"))throw new Exception("翻译服务没有返回有效俄语，请换一个更完整的中文表达。");
+                try{value=StressMark.Apply(value.Trim());}catch(Exception ex){throw new Exception("重音词典无法读取，请保持 data 文件夹与助手在一起。",ex);}
+                lock(settingsLock){if(version!=revision)throw new OperationCanceledException("翻译服务已切换，请重试。");CacheResult(s,value);}
+                return value;
+            } catch(HttpRequestException) {throw new Exception(UsesAzure?"无法连接微软翻译，请检查网络或代理设置。":"无法连接本机 Ollama。请先打开 Ollama，并确认 translategemma:4b 可用。");}
             finally {gate.Release();}
         }
-        public void Dispose() { client.Dispose(); }
+        public void Dispose() {client.Dispose();azureClient.Dispose();chatgpt.Dispose();deepseek.Dispose();}
+    }
+
+    sealed class TranslationSettingsForm : Form {
+        readonly ComboBox provider=new ComboBox();readonly TextBox key=new TextBox(),region=new TextBox(),deepKey=new TextBox();
+        readonly Label result=new Label();readonly Button save=new Button(),test=new Button(),cancel=new Button();
+        readonly string path;
+        internal TranslationSettings SavedSettings;
+        string verifiedDeepKey="";
+        internal TranslationSettingsForm(TranslationSettings current,string file,bool preferDeepSeek=false) {
+            verifiedDeepKey=current.UseDeepSeek?current.DeepSeekKey:"";
+            path=file;Text="翻译服务设置";ClientSize=new Size(650,515);FormBorderStyle=FormBorderStyle.FixedDialog;MaximizeBox=false;MinimizeBox=false;StartPosition=FormStartPosition.CenterParent;Font=new Font("Microsoft YaHei UI",10);
+            Controls.Add(new Label {Text="翻译服务",Location=new Point(24,23),AutoSize=true});
+            provider.DropDownStyle=ComboBoxStyle.DropDownList;provider.Items.AddRange(new object[]{"本地 Ollama（TranslateGemma 4B）","微软 Translator（在线，需要 F0 资源）","ChatGPT 订阅（GPT-5.6 Luna）","DeepSeek Flash（在线，关闭思考）"});provider.SetBounds(120,19,505,30);provider.SelectedIndex=preferDeepSeek||current.UseDeepSeek?3:current.UseChatGpt?2:current.UseAzure?1:0;Controls.Add(provider);
+            Controls.Add(new Label {Text="微软密钥",Location=new Point(24,70),AutoSize=true});
+            key.SetBounds(140,66,485,28);key.UseSystemPasswordChar=true;key.Text=current.Key;key.AccessibleName="Azure Translator 密钥";Controls.Add(key);
+            Controls.Add(new Label {Text="资源区域",Location=new Point(24,112),AutoSize=true});region.SetBounds(140,108,485,28);region.Text=current.Region;region.AccessibleName="Azure Translator 区域";Controls.Add(region);
+            Controls.Add(new Label {Text="DeepSeek 密钥",Location=new Point(24,154),AutoSize=true});deepKey.SetBounds(140,150,485,28);deepKey.UseSystemPasswordChar=true;deepKey.AccessibleName="DeepSeek API 密钥";deepKey.Text=current.DeepSeekKey;Controls.Add(deepKey);
+            Controls.Add(new Label {Text="微软：填写资源区域；global 可留空。请在 Azure 确认定价层 F0。\nChatGPT：先登录并允许使用 Plus / Pro 额度，再检查 GPT-5.6 Luna。\nDeepSeek：Flash 已关闭思考，调用按 API 用量计费。\n在线服务会收到选中的中文；俄语重音由本地词典添加。\n密钥由当前 Windows 账号加密保存，不写入源码或输入日志。",Location=new Point(24,195),Size=new Size(600,115)});
+            var open=new Button {Text="登录 ChatGPT / 账号",Location=new Point(24,326),Size=new Size(190,34)};open.Click+=(s,e)=>{try{if(provider.SelectedIndex==3){Process.Start(new ProcessStartInfo("https://platform.deepseek.com/api_keys") {UseShellExecute=true});}else if(provider.SelectedIndex==1){Process.Start(new ProcessStartInfo("https://portal.azure.com/#create/Microsoft.CognitiveServicesTextTranslation") {UseShellExecute=true});}else using(var dialog=new ChatGptAccountForm())if(dialog.ShowDialog(this)==DialogResult.OK&&dialog.UseLuna){provider.SelectedIndex=2;result.Text="GPT-5.6 Luna 已验证。可测试翻译，再点击“保存并使用”。";}}catch(Exception ex){result.Text=ex.Message;}};provider.SelectedIndexChanged+=(s,e)=>{open.Text=provider.SelectedIndex==3?"打开 DeepSeek 密钥页":provider.SelectedIndex==1?"打开 Azure 创建页面":"登录 ChatGPT / 账号";};open.Text=provider.SelectedIndex==3?"打开 DeepSeek 密钥页":provider.SelectedIndex==1?"打开 Azure 创建页面":"登录 ChatGPT / 账号";Controls.Add(open);
+            test.Text=preferDeepSeek?"测试并启用 DeepSeek":"测试：你好 → 俄语";test.SetBounds(230,326,230,34);test.Click+=async(s,e)=>{
+                bool activate=false;
+                try {
+                    var value=Read();value.Validate();test.Enabled=false;save.Enabled=false;cancel.Enabled=false;provider.Enabled=false;key.Enabled=false;region.Enabled=false;deepKey.Enabled=false;open.Enabled=false;ControlBox=false;
+                    result.Text="正在测试连接…";
+                    var timing=Stopwatch.StartNew();
+                    using(var translator=new Translator()){translator.Configure(value);string ru=await translator.Translate("你好",CancellationToken.None);result.Text="连接成功（"+timing.Elapsed.TotalSeconds.ToString("0.00")+" 秒）：你好 → "+StressMark.Display(ru)+"。点击保存即可使用。";}
+                    if(value.UseDeepSeek){verifiedDeepKey=value.DeepSeekKey;activate=preferDeepSeek;}
+                }catch(OperationCanceledException){result.Text="连接超时，请检查网络或服务状态。";}catch(Exception ex){result.Text=ex.Message;}
+                finally{test.Enabled=true;save.Enabled=true;cancel.Enabled=true;provider.Enabled=true;open.Enabled=true;ControlBox=true;UpdateFields();}
+                if(activate)save.PerformClick();
+            };Controls.Add(test);
+            result.SetBounds(24,374,600,70);result.Text=preferDeepSeek?"请粘贴 DeepSeek API 密钥，再点击“测试并启用 DeepSeek”。测试成功后自动保存并切换。":"先测试，再保存；测试会向当前选择的服务发送“你好”。";Controls.Add(result);
+            save.Text="保存并使用";save.SetBounds(380,464,125,32);save.Click+=(s,e)=>{try{var value=Read();if(value.UseDeepSeek&&value.DeepSeekKey!=verifiedDeepKey)throw new Exception("请先测试当前 DeepSeek 密钥，成功后再启用。");if(value.UseChatGpt){var active=ChatGptStore.Load(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings.chatgpt.dat")).Active;if(active==null||!active.Authorized)throw new Exception("请先点击“登录 ChatGPT / 账号”完成登录与订阅授权。");}value.Save(path);SavedSettings=value;DialogResult=DialogResult.OK;Close();}catch(Exception ex){result.Text=ex.Message;}};Controls.Add(save);
+            cancel.Text="取消";cancel.SetBounds(520,464,105,32);cancel.DialogResult=DialogResult.Cancel;Controls.Add(cancel);CancelButton=cancel;
+            provider.SelectedIndexChanged+=(s,e)=>UpdateFields();UpdateFields();
+        }
+        TranslationSettings Read(){return new TranslationSettings {UseAzure=provider.SelectedIndex==1,UseChatGpt=provider.SelectedIndex==2,UseDeepSeek=provider.SelectedIndex==3,Key=key.Text.Trim(),Region=region.Text.Trim().ToLowerInvariant(),DeepSeekKey=deepKey.Text.Trim()};}
+        void UpdateFields(){key.Enabled=provider.SelectedIndex==1;region.Enabled=key.Enabled;deepKey.Enabled=provider.SelectedIndex==3;}
     }
 
     sealed class Overlay : Form {
@@ -404,7 +527,7 @@ namespace PinyinRussian {
                 TextRenderer.DrawText(e.Graphics,RowText(option.Chinese),russianFont,new Rectangle(230,y+4,Width-242,h-8),ready?Color.FromArgb(20,44,84):Color.FromArgb(107,117,132),TextFormatFlags.WordBreak|TextFormatFlags.EndEllipsis);
                 y+=h;
             }
-            string hint=translations.ContainsKey(page.Chinese)?"Ctrl + Alt + R 输入第 "+page.SelectedNumber+" 项俄语 · Ctrl + Alt + C 复制":"仅翻译当前选中项 · 首次加载约 30 秒";
+            string hint=translations.ContainsKey(page.Chinese)?"Ctrl + Alt + R 输入第 "+page.SelectedNumber+" 项俄语 · Ctrl + Alt + C 复制":"仅翻译当前选中项";
             TextRenderer.DrawText(e.Graphics,hint,hintFont,new Rectangle(12,y+8,Width-24,24),Color.FromArgb(83,99,121));
             using(var p=new Pen(Color.FromArgb(154,176,205)))e.Graphics.DrawRectangle(p,0,0,Width-1,Height-1);
         }
@@ -440,7 +563,12 @@ namespace PinyinRussian {
         readonly CheckBox enabled=new CheckBox();
         readonly TrackBar transparency=new TrackBar();
         readonly Label transparencyValue=new Label(), transparencyHint=new Label();
+        readonly Label balance=new Label();readonly Button refreshBalance=new Button();
+        readonly ToolTip balanceDetails=new ToolTip();readonly DeepSeekClient balanceClient=new DeepSeekClient();
+        readonly System.Windows.Forms.Timer balanceTimer=new System.Windows.Forms.Timer {Interval=300000};
+        CancellationTokenSource balanceCancel;int balanceRevision;string balanceSnapshot="";DateTime balanceUpdated;
         readonly string settingsPath;
+        readonly string translationSettingsPath;TranslationSettings translationSettings;
         Candidate current;string translated;CancellationTokenSource translateCancel;
         readonly Dictionary<string,string> pageTranslations=new Dictionary<string,string>(), pageErrors=new Dictionary<string,string>();
         DateTime stableSince;bool requested,inserting,closing;volatile bool monitorEnabled=true;
@@ -448,7 +576,8 @@ namespace PinyinRussian {
         internal MainForm(bool hideAtStartup=false,string preferencesPath=null) {
             startHidden=hideAtStartup;
             settingsPath=preferencesPath??Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"settings.json");
-            Text="拼音俄语助手 · 本地离线版";ClientSize=new Size(720,640);MinimumSize=new Size(700,640);Font=new Font("Microsoft YaHei UI",10);StartPosition=FormStartPosition.CenterScreen;BackColor=Color.FromArgb(247,249,253);
+            translationSettingsPath=Path.ChangeExtension(settingsPath,"translation.json");translationSettings=TranslationSettings.Load(translationSettingsPath);translator.Configure(translationSettings);
+            Text="拼音俄语助手";ClientSize=new Size(720,688);MinimumSize=new Size(700,688);Font=new Font("Microsoft YaHei UI",10);StartPosition=FormStartPosition.CenterScreen;BackColor=Color.FromArgb(247,249,253);
             var title=new Label {Text="拼音 → 俄语",Font=new Font("Microsoft YaHei UI",22,FontStyle.Bold),ForeColor=Color.FromArgb(27,55,96),AutoSize=true,Location=new Point(24,20)};Controls.Add(title);
             enabled.Text="自动跟随微软拼音候选词";enabled.Checked=true;enabled.AutoSize=true;enabled.Location=new Point(26,83);enabled.CheckedChanged+=(s,e)=>{monitorEnabled=enabled.Checked;if(!monitorEnabled)Reset();};Controls.Add(enabled);
             var help=new Label {Text="候选框出现后稍停，只显示当前选中候选词或句子的俄语。\nCtrl + Alt + R：取消未上屏拼音并输入当前选中项的俄语（不发送）\nCtrl + Alt + C：复制当前选中项的俄语　　Ctrl + Alt + P：暂停 / 继续\n自动跟随需开启微软拼音“使用以前版本”。",Location=new Point(24,116),Size=new Size(675,96)};Controls.Add(help);
@@ -457,17 +586,67 @@ namespace PinyinRussian {
             var resetTransparency=new Button {Text="恢复默认",Location=new Point(575,216),Size=new Size(119,32)};resetTransparency.Click+=(s,e)=>{if(transparency.Value==UiSettings.DefaultTransparency)ApplyTransparency(true);else transparency.Value=UiSettings.DefaultTransparency;};Controls.Add(resetTransparency);
             transparencyHint.SetBounds(24,260,675,24);transparencyHint.Font=new Font("Microsoft YaHei UI",9);transparencyHint.ForeColor=Color.FromArgb(83,99,121);Controls.Add(transparencyHint);
             transparency.ValueChanged+=(s,e)=>ApplyTransparency(true);ApplyTransparency(false);
-            status.Location=new Point(24,293);status.Size=new Size(675,25);status.ForeColor=Color.FromArgb(35,91,123);status.Text="等待拼音候选词 · 翻译只连接本机 Ollama";Controls.Add(status);
-            last.Location=new Point(24,322);last.Size=new Size(675,38);last.Text="单字可能有多种含义，完整词句通常更准确。";Controls.Add(last);
-            Controls.Add(new Label {Text="整句翻译 / 手动备用（输入或粘贴中文）",Location=new Point(24,365),AutoSize=true});
-            input.Multiline=true;input.SetBounds(24,392,670,66);input.Font=new Font("Microsoft YaHei UI",12);input.Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right;Controls.Add(input);
-            var button=new Button {Text="翻译整句",Location=new Point(24,469),Size=new Size(125,32)};button.Click+=async(s,e)=>{button.Enabled=false;output.Tag=null;output.Text="正在本地翻译…";try{string ru=await translator.Translate(input.Text.Trim(),CancellationToken.None);output.Tag=ru;output.Text=StressMark.Display(ru);}catch(Exception ex){output.Text=ex.Message;}finally{button.Enabled=true;}};Controls.Add(button);
-            var copy=new Button {Text="复制整句俄语",Location=new Point(160,469),Size=new Size(145,32)};copy.Click+=(s,e)=>{string ru=output.Tag as string;if(ru!=null)try{Clipboard.SetText(ru);}catch{status.Text="剪贴板正忙，请重试。";}};Controls.Add(copy);
-            output.Multiline=true;output.ReadOnly=true;output.SetBounds(24,512,670,90);output.Font=new Font("Segoe UI",12);output.ScrollBars=ScrollBars.Vertical;output.Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right;Controls.Add(output);
-            Controls.Add(new Label {Text="〔?〕表示重音待确认；复制和输入只包含俄语与已确认重音。关闭窗口后在托盘继续运行。",Location=new Point(24,612),AutoSize=true,Font=new Font("Microsoft YaHei UI",8)});
+            status.Location=new Point(24,293);status.Size=new Size(675,25);status.ForeColor=Color.FromArgb(35,91,123);status.Text=WaitingStatus();Controls.Add(status);
+            balance.SetBounds(24,326,540,32);balance.AutoEllipsis=true;balance.ForeColor=Color.FromArgb(35,91,123);balance.AccessibleName="DeepSeek 余额";Controls.Add(balance);
+            refreshBalance.Text="刷新余额";refreshBalance.SetBounds(575,322,119,32);refreshBalance.Click+=(s,e)=>RefreshBalance();Controls.Add(refreshBalance);
+            balanceTimer.Tick+=(s,e)=>{if(Visible&&!closing)RefreshBalance();};
+            last.Location=new Point(24,370);last.Size=new Size(675,38);last.Text="单字可能有多种含义，完整词句通常更准确。";Controls.Add(last);
+            Controls.Add(new Label {Text="整句翻译 / 手动备用（输入或粘贴中文）",Location=new Point(24,413),AutoSize=true});
+            input.Multiline=true;input.SetBounds(24,440,670,66);input.Font=new Font("Microsoft YaHei UI",12);input.Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right;Controls.Add(input);
+            var button=new Button {Text="翻译整句",Location=new Point(24,517),Size=new Size(125,32)};button.Click+=async(s,e)=>{button.Enabled=false;output.Tag=null;output.Text="正在翻译…";try{string ru=await translator.Translate(input.Text.Trim(),CancellationToken.None);output.Tag=ru;output.Text=StressMark.Display(ru);}catch(Exception ex){output.Text=ex.Message;}finally{button.Enabled=true;}};Controls.Add(button);
+            var copy=new Button {Text="复制整句俄语",Location=new Point(160,517),Size=new Size(145,32)};copy.Click+=(s,e)=>{string ru=output.Tag as string;if(ru!=null)try{Clipboard.SetText(ru);}catch{status.Text="剪贴板正忙，请重试。";}};Controls.Add(copy);
+            var service=new Button {Text="翻译服务设置",Location=new Point(535,517),Size=new Size(159,32)};service.Click+=(s,e)=>OpenServices();Controls.Add(service);
+            output.Multiline=true;output.ReadOnly=true;output.SetBounds(24,560,670,90);output.Font=new Font("Segoe UI",12);output.ScrollBars=ScrollBars.Vertical;output.Anchor=AnchorStyles.Top|AnchorStyles.Left|AnchorStyles.Right;Controls.Add(output);
+            Controls.Add(new Label {Text="〔?〕表示重音待确认；复制和输入只包含俄语与已确认重音。关闭窗口后在托盘继续运行。",Location=new Point(24,660),AutoSize=true,Font=new Font("Microsoft YaHei UI",8)});
             tray.Icon=SystemIcons.Information;tray.Text="拼音俄语助手";tray.Visible=true;
             var menu=new ContextMenuStrip();menu.Items.Add("打开助手",null,(s,e)=>Open());menu.Items.Add("暂停 / 继续",null,(s,e)=>enabled.Checked=!enabled.Checked);menu.Items.Add("退出",null,(s,e)=>{closing=true;Close();});tray.ContextMenuStrip=menu;tray.DoubleClick+=(s,e)=>Open();
-            Shown+=(s,e)=>{StartMonitor();if(startHidden)Hide();};FormClosing+=(s,e)=>{if(!closing && e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Hide();return;}closing=true;monitorEnabled=false;if(translateCancel!=null)translateCancel.Cancel();for(int i=1;i<=3;i++)Native.UnregisterHotKey(Handle,i);tray.Visible=false;overlay.Close();};
+            Shown+=(s,e)=>{StartMonitor();if(startHidden)Hide();RefreshBalance(true);balanceTimer.Start();};FormClosing+=(s,e)=>{if(!closing && e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Hide();return;}closing=true;balanceTimer.Stop();if(balanceCancel!=null)balanceCancel.Cancel();monitorEnabled=false;if(translateCancel!=null)translateCancel.Cancel();for(int i=1;i<=3;i++)Native.UnregisterHotKey(Handle,i);tray.Visible=false;overlay.Close();};
+            FormClosed+=(s,e)=>{balanceTimer.Dispose();balanceClient.Dispose();balanceDetails.Dispose();};
+        }
+        internal void OpenServices(bool preferDeepSeek=false) {
+                bool wasEnabled=monitorEnabled;monitorEnabled=false;Reset();
+                try{using(var dialog=new TranslationSettingsForm(translationSettings,translationSettingsPath,preferDeepSeek))if(dialog.ShowDialog(this)==DialogResult.OK){translationSettings=dialog.SavedSettings;translator.Configure(translationSettings);output.Tag=null;output.Clear();status.Text=WaitingStatus();}}
+                finally{translator.Configure(translationSettings);output.Tag=null;output.Clear();Reset();monitorEnabled=wasEnabled;status.Text=WaitingStatus();RefreshBalance(true);}
+        }
+        internal async void ConnectChatGpt(bool useSavedAccount=false) {
+            bool wasEnabled=monitorEnabled;monitorEnabled=false;Reset();
+            var connection=new ChatGptClient();
+            try {
+                if(useSavedAccount) {
+                    connection.LoginStatus("checking_model");
+                    await connection.CheckLuna(CancellationToken.None);
+                }else using(var dialog=new ChatGptAccountForm(true)) {
+                    if(dialog.ShowDialog(this)!=DialogResult.OK||!dialog.UseLuna){status.Text="ChatGPT 尚未启用，可在翻译服务设置中继续登录。";return;}
+                }
+                var value=translationSettings.Copy();value.UseChatGpt=true;value.UseAzure=false;value.UseDeepSeek=false;
+                status.Text="正在验证 GPT-5.6 Luna：你好 → 俄语…";
+                connection.LoginStatus("testing_translation");
+                string ru;using(var test=new Translator()){test.Configure(value);ru=await test.Translate("你好",CancellationToken.None);}
+                value.Save(translationSettingsPath);translationSettings=value;translator.Configure(value);output.Tag=ru;output.Text=StressMark.Display(ru);status.Text="ChatGPT 已接入 · GPT-5.6 Luna · 测试：你好 → "+StressMark.Display(ru);
+                connection.LoginStatus("translation_enabled");
+            }catch(Exception ex){connection.LoginStatus("verification_failed");status.Text=ex is OperationCanceledException?"ChatGPT 验证超时，请在翻译服务设置中重试。":ex.Message;}
+            finally{connection.Dispose();monitorEnabled=wasEnabled;RefreshBalance(true);}
+        }
+        internal async void RefreshBalance(bool reset=false) {
+            if(closing||IsDisposed)return;
+            if(reset){balanceRevision++;if(balanceCancel!=null)balanceCancel.Cancel();balanceCancel=null;balanceSnapshot="";balanceDetails.SetToolTip(balance,"");}
+            if(!translationSettings.UseDeepSeek){balance.Text="余额：仅 DeepSeek 服务支持查询";refreshBalance.Enabled=false;return;}
+            if(balanceCancel!=null)return;
+            var snapshot=translationSettings.Copy();int revision=balanceRevision;var cancel=new CancellationTokenSource();balanceCancel=cancel;refreshBalance.Enabled=false;
+            balance.Text=balanceSnapshot==""?"DeepSeek 余额：正在查询…":balanceSnapshot+" · 正在刷新…";
+            Func<bool> active=()=>!closing&&!IsDisposed&&revision==balanceRevision&&translationSettings.UseDeepSeek&&snapshot.DeepSeekKey==translationSettings.DeepSeekKey;
+            try {
+                snapshot.Validate();var value=await balanceClient.GetBalance(snapshot.DeepSeekKey,cancel.Token);
+                if(!active()||cancel.IsCancellationRequested)return;
+                balanceUpdated=DateTime.Now;balanceSnapshot=value.Summary;balance.Text=balanceSnapshot+" · "+balanceUpdated.ToString("HH:mm")+" 更新";
+                balanceDetails.SetToolTip(balance,String.Join("\n",value.Details)+"\n更新时间："+balanceUpdated.ToString("HH:mm:ss")+"；窗口显示期间每 5 分钟刷新，也可手动刷新。余额不保存到磁盘。");
+            }catch(OperationCanceledException){if(active()&&!closing)BalanceFailure("查询超时，请刷新重试");}
+            catch(Exception ex){if(active())BalanceFailure(ex.Message);}
+            finally {if(revision==balanceRevision&&!closing&&!IsDisposed){balanceCancel=null;refreshBalance.Enabled=translationSettings.UseDeepSeek;}cancel.Dispose();}
+        }
+        void BalanceFailure(string error) {
+            balance.Text=balanceSnapshot==""?"DeepSeek 余额：查询失败（悬停查看原因）":balanceSnapshot+" · 更新失败（上次 "+balanceUpdated.ToString("HH:mm")+"）";
+            balanceDetails.SetToolTip(balance,error+(balanceSnapshot==""?"":"\n显示的是上次成功查询的余额，可能已变化。"));
         }
         void ApplyTransparency(bool save) {
             overlay.Opacity=(100-transparency.Value)/100.0;
@@ -476,6 +655,7 @@ namespace PinyinRussian {
             if(save&&!UiSettings.SaveTransparency(settingsPath,transparency.Value))transparencyHint.Text="已生效，但设置无法保存；重启后将使用之前的设置。";
         }
         void Open(){Show();WindowState=FormWindowState.Normal;Activate();}
+        string WaitingStatus(){return "等待拼音候选词 · "+translator.ServiceName;}
         void StartMonitor() {
             uint mods=0x4000|0x0002|0x0001;
             if(Native.RegisterHotKey(Handle,1,mods,0x52))hotkeyMask|=1;
@@ -489,16 +669,22 @@ namespace PinyinRussian {
                         uint pid;Native.GetWindowThreadProcessId(Native.GetForegroundWindow(),out pid);
                         File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"diagnostics.txt"),DateTime.UtcNow.ToString("O")+"\nforeground="+Process.GetProcessById((int)pid).ProcessName+"\nstage="+Reader.Diagnostic+"\nwindows="+Reader.LastScan+"\nevents="+Reader.EventCount+"\nfound="+(c!=null));
                     }}catch{}
-                    try{if(!closing)BeginInvoke(new Action(()=>Observe(c)));}catch{}Thread.Sleep(180);}
+                    try{if(!closing)BeginInvoke(new Action(()=>Observe(c)));}catch{}Thread.Sleep(80);}
             });worker.IsBackground=true;worker.SetApartmentState(ApartmentState.MTA);worker.Start();
         }
         void Reset() {current=null;translated=null;requested=false;if(translateCancel!=null)translateCancel.Cancel();pageTranslations.Clear();pageErrors.Clear();overlay.Hide();}
         async void Observe(Candidate c) {
             if(closing||inserting)return;
             if(!monitorEnabled){Reset();status.Text="已暂停自动翻译 · Ctrl + Alt + P 继续";return;}
-            if(c==null){if(current!=null){Reset();status.Text="等待拼音候选词 · 翻译只连接本机 Ollama";}return;}
+            if(c==null){if(current!=null){Reset();status.Text=WaitingStatus();}return;}
             if(!c.Same(current)) {
                 Reset();current=c;stableSince=DateTime.UtcNow;
+                string cached;
+                if(translator.TryCached(c.Chinese,out cached)) {
+                    pageTranslations[c.Chinese]=cached;translated=cached;requested=true;
+                    last.Text=c.Chinese+" → "+cached;status.Text="当前选中项翻译完成 · 缓存";
+                    overlay.Display(c,pageTranslations,pageErrors,"翻译完成 · 缓存");return;
+                }
                 last.Text="等待第 "+c.SelectedNumber+" 项稳定…";
                 status.Text="等待当前选中候选项稳定…";
                 overlay.Display(c,pageTranslations,pageErrors,"等待候选词稳定…");return;
@@ -506,7 +692,7 @@ namespace PinyinRussian {
             current=c;
             translated=pageTranslations.ContainsKey(c.Chinese)?pageTranslations[c.Chinese]:null;
             overlay.Display(c,pageTranslations,pageErrors,requested?"正在翻译…":"等待候选词稳定…");
-            if(requested||DateTime.UtcNow-stableSince<TimeSpan.FromMilliseconds(300))return;
+            if(requested||DateTime.UtcNow-stableSince<TimeSpan.FromMilliseconds(160))return;
             requested=true;translateCancel=new CancellationTokenSource();var token=translateCancel.Token;var started=Stopwatch.StartNew();
             last.Text="正在翻译第 "+c.SelectedNumber+" 项…";
             status.Text="正在翻译当前选中候选项…";
@@ -524,7 +710,7 @@ namespace PinyinRussian {
             translated=pageTranslations.ContainsKey(c.Chinese)?pageTranslations[c.Chinese]:null;
             overlay.Display(current,pageTranslations,pageErrors,"正在翻译…");
             last.Text=translated==null?"第 "+c.SelectedNumber+" 项翻译失败。":c.Chinese+" → "+translated;
-            status.Text=pageErrors.Count==0?"当前选中项翻译完成 · "+started.Elapsed.TotalSeconds.ToString("0.00")+" 秒":"当前选中项翻译失败，请重新输入或检查 Ollama。";
+            status.Text=pageErrors.Count==0?"当前选中项翻译完成 · "+started.Elapsed.TotalSeconds.ToString("0.00")+" 秒":"当前选中项翻译失败，请重新输入或检查翻译服务设置。";
         }
         protected override void WndProc(ref Message m) {
             if(m.Msg==0x312) {
@@ -565,7 +751,7 @@ namespace PinyinRussian {
         [STAThread] static void Main(string[] args) {
             bool created;using(var mutex=new Mutex(true,"Local\\PinyinRussianCompanion_20261004",out created)) {
                 if(!created){MessageBox.Show("拼音俄语助手已经运行，请从系统托盘打开。","拼音俄语助手");return;}
-                Native.SetProcessDPIAware();Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);Application.Run(new MainForm(args.Contains("--tray")));
+                Native.SetProcessDPIAware();Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);var form=new MainForm(args.Contains("--tray"));if(args.Contains("--deepseek-settings"))form.Shown+=(s,e)=>form.BeginInvoke(new Action(()=>form.OpenServices(true)));else if(args.Contains("--activate-chatgpt"))form.Shown+=(s,e)=>form.BeginInvoke(new Action(()=>form.ConnectChatGpt(true)));else if(args.Contains("--connect-chatgpt"))form.Shown+=(s,e)=>form.BeginInvoke(new Action(()=>form.ConnectChatGpt()));else if(args.Contains("--services"))form.Shown+=(s,e)=>form.BeginInvoke(new Action(()=>form.OpenServices()));Application.Run(form);
             }
         }
     }

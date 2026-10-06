@@ -11,3 +11,8 @@ settings.json
 settings.json.tmp
 __pycache__/
 *.pyc
+settings.translation.json
+settings.translation.json.tmp
+settings.chatgpt.dat
+settings.chatgpt.dat.tmp
+chatgpt-login-status.json
