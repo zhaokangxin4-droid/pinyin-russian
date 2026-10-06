@@ -137,7 +137,7 @@ namespace PinyinRussian {
         static void WalkCandidates(UIAutomationClient.IUIAutomationElement element,UIAutomationClient.IUIAutomationTreeWalker walker,
             int depth,ref int remaining,List<UIAutomationClient.IUIAutomationElement> result) {
             if(element==null || depth>8 || remaining--<=0)return;
-            if(element.CurrentAutomationId.StartsWith("CandidateList.CandidateButton.",StringComparison.Ordinal))result.Add(element);
+            if(element.CurrentAutomationId.StartsWith("CandidateList.CandidateButton.",StringComparison.Ordinal) || element.CurrentControlType==50007 || element.CurrentControlType==50011)result.Add(element);
             var child=walker.GetFirstChildElement(element);
             while(child!=null && remaining>0) {
                 WalkCandidates(child,walker,depth+1,ref remaining,result);
@@ -221,37 +221,68 @@ namespace PinyinRussian {
                 UIAutomationClient.IUIAutomationElement focus=null;
                 try{focus=UI.GetFocusedElement();}catch{}
                 if(focus!=null && focus.CurrentIsPassword!=0) {Diagnostic="password field";return null;}
+                var nativeFocus=Native.FocusWindow(hwnd);
+                if(nativeFocus!=IntPtr.Zero)try{if(UI.ElementFromHandle(nativeFocus).CurrentIsPassword!=0){Diagnostic="password field";return null;}}catch{return null;}
+                Rectangle compositionBounds;
+                var composition=ModernIme.Composition(hwnd,out compositionBounds);
+                if(composition!=IntPtr.Zero) {
+                    // Old Microsoft Pinyin also has a composition window, but its separate
+                    // accessible candidate host must retain the original reader path.
+                    var modern=ModernIme.Read(hwnd,composition,compositionBounds,nativeFocus);
+                    if(modern!=null){Diagnostic=ModernIme.Diagnostic;return modern;}
+                }
                 Diagnostic="finding candidate; UIA focus="+(focus!=null);
                 var panel=FindPanel(hwnd);
-                if(panel==null || panel.CurrentIsOffscreen!=0) return null;
+                if(panel==null || panel.CurrentIsOffscreen!=0) {if(composition!=IntPtr.Zero)Diagnostic=ModernIme.Diagnostic;return null;}
                 lock(eventLock) {eventPanel=panel;eventWindow=hwnd;}
                 var items=CandidateItems(panel);
                 UIAutomationClient.IUIAutomationElement selected=null, first=null, focused=null;
                 var options=new List<CandidateOption>();
+                bool legacyItems=items.Any(item=>item.CurrentAutomationId.StartsWith("CandidateList.CandidateButton.",StringComparison.Ordinal));
+                var values=new Dictionary<UIAutomationClient.IUIAutomationElement,CandidateOption>();
                 for(int i=0;i<items.Count;i++) {
                     var item=items[i];
-                    if(!item.CurrentAutomationId.StartsWith("CandidateList.CandidateButton.",StringComparison.Ordinal) || item.CurrentIsOffscreen!=0 || !IsChinese(item.CurrentName))continue;
-                    int slot;
-                    if(!Int32.TryParse(item.CurrentAutomationId.Substring("CandidateList.CandidateButton.".Length),out slot))continue;
+                    bool oldItem=item.CurrentAutomationId.StartsWith("CandidateList.CandidateButton.",StringComparison.Ordinal);
+                    if(legacyItems&&!oldItem || item.CurrentIsOffscreen!=0 || !IsChinese(item.CurrentName))continue;
+                    int slot=i;string chinese=item.CurrentName;
+                    if(oldItem && !Int32.TryParse(item.CurrentAutomationId.Substring("CandidateList.CandidateButton.".Length),out slot))continue;
+                    if(!oldItem){var numbered=Regex.Match(chinese,@"^\s*([1-9])\s+(.+)$");if(numbered.Success){slot=Int32.Parse(numbered.Groups[1].Value)-1;chinese=numbered.Groups[2].Value;}}
                     var itemRect=item.CurrentBoundingRectangle;
                     if(itemRect.right<=itemRect.left || itemRect.bottom<=itemRect.top)continue;
-                    options.Add(new CandidateOption {Number=slot+1,Chinese=item.CurrentName});
+                    var option=new CandidateOption {Number=slot+1,Chinese=chinese};options.Add(option);values[item]=option;
                     if(first==null)first=item;
                     var state=item.GetCurrentPropertyValue(30079);
                     if(state is bool && (bool)state)selected=item;
                     if(item.CurrentHasKeyboardFocus!=0 && focused==null)focused=item;
+                    if(!oldItem){var accessible=item.GetCurrentPropertyValue(UIAutomationClient.UIA_PropertyIds.UIA_LegacyIAccessibleStatePropertyId);if(accessible is int && (((int)accessible&2)!=0 || ((int)accessible&4)!=0))selected=item;}
                 }
-                if(selected==null)selected=focused??first;
-                if(selected==null){Diagnostic="no Chinese candidate";return null;}
+                if(selected==null)selected=focused??(legacyItems?first:null);
+                if(selected==null){
+                    var panelRect=panel.CurrentBoundingRectangle;
+                    var panelBounds=Rectangle.FromLTRB(panelRect.left,panelRect.top,panelRect.right,panelRect.bottom);
+                    LastScan="panel="+panel.CurrentAutomationId+"; class="+panel.CurrentClassName+"; rect="+panelBounds+"; children="+items.Count;
+                    var modern=ModernIme.ReadPanel(hwnd,nativeFocus,panelBounds,()=>{
+                        if(panel.CurrentIsOffscreen!=0)return false;
+                        var fresh=panel.CurrentBoundingRectangle;
+                        return Rectangle.FromLTRB(fresh.left,fresh.top,fresh.right,fresh.bottom)==panelBounds;
+                    });
+                    Diagnostic=modern==null?"no Chinese candidate; "+ModernIme.Diagnostic:ModernIme.Diagnostic;
+                    return modern;
+                }
                 var r=panel.CurrentBoundingRectangle;
                 if(r.right-r.left<10 || r.bottom-r.top<10){Diagnostic="invalid bounds";return null;}
                 Diagnostic="candidate ready";
-                int selectedSlot=Int32.Parse(selected.CurrentAutomationId.Substring("CandidateList.CandidateButton.".Length));
-                return new Candidate {Chinese=selected.CurrentName,SelectedNumber=selectedSlot+1,Options=options.OrderBy(x=>x.Number).ToArray(),Window=hwnd,FocusId=focus==null?"native:"+Native.FocusWindow(hwnd):FocusId(focus),Bounds=CandidateBounds(panel,Rectangle.FromLTRB(r.left,r.top,r.right,r.bottom))};
+                var chosen=values[selected];
+                return new Candidate {Chinese=chosen.Chinese,SelectedNumber=chosen.Number,Options=options.OrderBy(x=>x.Number).ToArray(),Window=hwnd,FocusId=!legacyItems||focus==null?"native:"+nativeFocus:FocusId(focus),Bounds=CandidateBounds(panel,Rectangle.FromLTRB(r.left,r.top,r.right,r.bottom))};
             } catch(Exception ex) {Diagnostic=ex.GetType().Name+": "+ex.Message;return null;}
         }
         internal static bool FocusMatches(Candidate c) {
             if(Native.GetForegroundWindow()!=c.Window)return false;
+            if(c.FocusId.StartsWith("native:",StringComparison.Ordinal)) {
+                var nativeFocus=Native.FocusWindow(c.Window);
+                if(nativeFocus==IntPtr.Zero || c.FocusId!="native:"+nativeFocus)return false;
+                try{return UI.ElementFromHandle(nativeFocus).CurrentIsPassword==0;}catch{return false;}
+            }
             try {var f=UI.GetFocusedElement();return f!=null && f.CurrentIsPassword==0 && FocusId(f)==c.FocusId;}catch{return false;}
         }
     }
@@ -580,7 +611,7 @@ namespace PinyinRussian {
             Text="拼音俄语助手";ClientSize=new Size(720,688);MinimumSize=new Size(700,688);Font=new Font("Microsoft YaHei UI",10);StartPosition=FormStartPosition.CenterScreen;BackColor=Color.FromArgb(247,249,253);
             var title=new Label {Text="拼音 → 俄语",Font=new Font("Microsoft YaHei UI",22,FontStyle.Bold),ForeColor=Color.FromArgb(27,55,96),AutoSize=true,Location=new Point(24,20)};Controls.Add(title);
             enabled.Text="自动跟随微软拼音候选词";enabled.Checked=true;enabled.AutoSize=true;enabled.Location=new Point(26,83);enabled.CheckedChanged+=(s,e)=>{monitorEnabled=enabled.Checked;if(!monitorEnabled)Reset();};Controls.Add(enabled);
-            var help=new Label {Text="候选框出现后稍停，只显示当前选中候选词或句子的俄语。\nCtrl + Alt + R：取消未上屏拼音并输入当前选中项的俄语（不发送）\nCtrl + Alt + C：复制当前选中项的俄语　　Ctrl + Alt + P：暂停 / 继续\n自动跟随需开启微软拼音“使用以前版本”。",Location=new Point(24,116),Size=new Size(675,96)};Controls.Add(help);
+            var help=new Label {Text="候选框出现后稍停，只显示当前选中候选词或句子的俄语。\nCtrl + Alt + R：取消未上屏拼音并输入当前选中项的俄语（不发送）\nCtrl + Alt + C：复制当前选中项的俄语　　Ctrl + Alt + P：暂停 / 继续\n支持新版和旧版微软拼音；请核对浮窗中的中文候选词。",Location=new Point(24,116),Size=new Size(675,96)};Controls.Add(help);
             transparencyValue.SetBounds(24,222,185,25);Controls.Add(transparencyValue);
             transparency.Minimum=0;transparency.Maximum=100;transparency.TickFrequency=10;transparency.SmallChange=1;transparency.LargeChange=10;transparency.AccessibleName="浮窗透明度";transparency.SetBounds(209,213,355,45);transparency.Value=UiSettings.LoadTransparency(settingsPath);Controls.Add(transparency);
             var resetTransparency=new Button {Text="恢复默认",Location=new Point(575,216),Size=new Size(119,32)};resetTransparency.Click+=(s,e)=>{if(transparency.Value==UiSettings.DefaultTransparency)ApplyTransparency(true);else transparency.Value=UiSettings.DefaultTransparency;};Controls.Add(resetTransparency);

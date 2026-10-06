@@ -8,14 +8,14 @@ Windows 微软拼音输入法的俄语翻译伴侣。输入拼音后，在候选
 
 ## 下载与启动
 
-1. 在 [Releases](https://github.com/zhaokangxin4-droid/pinyin-russian/releases/latest) 下载 `PinyinRussian-v1.1.0-win-x64.zip`，完整解压。
+1. 在 [Releases](https://github.com/zhaokangxin4-droid/pinyin-russian/releases/latest) 下载 `PinyinRussian-v1.1.1-win-x64.zip`，完整解压。
 2. 选择翻译方式。在线翻译无需安装 Ollama：启动程序后打开“翻译服务设置”，选择服务、完成密钥或订阅授权配置并测试，再保存。若使用默认的本地翻译，在 Windows 64 位系统安装并运行 [Ollama](https://ollama.com/download/windows)，下载模型：
 
    ```powershell
    ollama pull translategemma:4b
    ```
 
-3. 打开 Windows 设置 → 时间和语言 → 语言和区域 → 微软拼音 → 常规 → 兼容性，开启“使用以前版本的微软拼音输入法”。如果刚修改，重新打开要输入文字的软件。
+3. 支持新版和旧版微软拼音。新版可保持“使用以前版本的微软拼音输入法”关闭。优先读取候选菜单，无法读取时使用 Windows 11 的简体中文文字识别语言包。刚切换版本时，重新打开要输入文字的软件。新版目前验证了浅色横排候选框；请核对浮窗里的中文候选词，其他布局或识别不准时可切回旧版。
 4. 双击解压目录中的 `PinyinRussian.exe`，在中文模式下输入拼音，稍停后查看俄语浮窗。
 
 `PinyinRussian.exe`、`Interop.UIAutomationClient.dll` 和 `data` 文件夹必须保存在一起。程序使用 Windows 的 .NET Framework，不需要 Python。本地模式不需要 API 密钥，模型需单独下载；在线模式需要自己的密钥或授权，安装包不含模型权重、密钥或登录凭据。
@@ -66,7 +66,7 @@ DeepSeek 接入：打开“翻译服务设置”，选择 DeepSeek、填入密�
 
 默认使用本机 Ollama 的 [`translategemma:4b`](https://ollama.com/library/translategemma:4b)，请求只发往 `http://127.0.0.1:11434/api/chat`。选择在线服务后，当前选中候选项或手动提交的整句通过 HTTPS 发送给所选服务，俄语重音仍由本地词典处理。
 
-助手不把输入文字或令牌写入日志，翻译缓存只在内存中。DeepSeek 与微软密钥分别由 Windows 当前用户加密保存在 `settings.translation.json`，ChatGPT 凭据保存在 `settings.chatgpt.dat`。这些文件、临时副本和登录状态记录都被 Git 忽略，发布脚本只打包明确列出的公共文件。请勿分享自己的安装目录或凭据文件；下载者需自行配置自己的服务。
+新版在本机识别拼音组合窗口旁的一小条候选区域，截图不保存、不上传；仅当前选中中文按所选服务发送。OCR 可能误认汉字，请核对浮窗中文。助手不把输入文字或令牌写入日志，翻译缓存只在内存中。DeepSeek 与微软密钥分别由 Windows 当前用户加密保存在 `settings.translation.json`，ChatGPT 凭据保存在 `settings.chatgpt.dat`。这些文件、临时副本和登录状态记录都被 Git 忽略，发布脚本只打包明确列出的公共文件。请勿分享自己的安装目录或凭据文件；下载者需自行配置自己的服务。
 
 本项目是 Windows 桌面程序。GitHub 提供源码与安装包下载，网页本身不接管输入法。
 
@@ -84,7 +84,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 
 也可以按固定的上游版本自行生成词典，见 [词典构建说明](scripts/README.md)。
 
-词典文件准备完成后，可用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-release.ps1 -Version 1.1.0` 生成 Windows ZIP 和 `SHA256SUMS.txt`。脚本使用固定文件清单，不会包含本机的设置、密钥或登录记录。
+词典文件准备完成后，可用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-release.ps1 -Version 1.1.1` 生成 Windows ZIP 和 `SHA256SUMS.txt`。脚本使用固定文件清单，不会包含本机的设置、密钥或登录记录。
 
 ## 验证与兼容性
 
